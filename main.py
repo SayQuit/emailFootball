@@ -24,11 +24,14 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import feedparser
+import trafilatura
 
 BEIJING = timezone(timedelta(hours=8))
 LOOKBACK_HOURS = 26  # 比 24 小时略长，抵消 GitHub 定时任务的延迟
 SUMMARY_MAX_CHARS = 300
-USER_AGENT = "Mozilla/5.0 emailFootball"
+ARTICLE_MAX_CHARS = 6000  # 单篇正文上限，防止邮件过长
+TRANSLATE_CHUNK_CHARS = 1500  # 翻译接口走 GET 请求，过长的文本要分段
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 # (来源名, RSS 地址, 是否皇马专题)
 FEEDS = [
@@ -42,8 +45,12 @@ FEEDS = [
 # 综合新闻源里提到这些词的新闻也归入皇马栏目
 REAL_MADRID_PATTERN = re.compile(r"real madrid|bernab[eé]u", re.IGNORECASE)
 
-REAL_MADRID_LIMIT = 10
-WORLD_LIMIT = 15
+# 论坛帖、直播文字流、视频页没有可读的正文，直接跳过
+SKIP_TITLE_PATTERN = re.compile(r"\bthread\b", re.IGNORECASE)
+SKIP_LINK_PATTERN = re.compile(r"/live/|/videos?/|/audio/")
+
+REAL_MADRID_LIMIT = 8
+WORLD_LIMIT = 10
 
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
@@ -78,6 +85,45 @@ def translate(text):
         except Exception as e:
             print(f"翻译失败（第 {attempt + 1} 次）: {e}")
             time.sleep(2)
+    return text
+
+
+def translate_long(text):
+    """按段落分组翻译长文本，保留段落结构。"""
+    chunks, current = [], ""
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        while len(para) > TRANSLATE_CHUNK_CHARS:
+            chunks.append(para[:TRANSLATE_CHUNK_CHARS])
+            para = para[TRANSLATE_CHUNK_CHARS:]
+        if current and len(current) + len(para) + 1 > TRANSLATE_CHUNK_CHARS:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n{para}" if current else para
+    if current:
+        chunks.append(current)
+
+    translated = []
+    for chunk in chunks:
+        translated.append(translate(chunk))
+        time.sleep(0.3)
+    return "\n".join(translated)
+
+
+def fetch_article(url):
+    """打开原文页面提取正文，失败返回空字符串。"""
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        text = trafilatura.extract(downloaded, include_comments=False, include_tables=False) if downloaded else None
+    except Exception as e:
+        print(f"正文提取失败 {url}: {e}")
+        return ""
+    if not text:
+        return ""
+    if len(text) > ARTICLE_MAX_CHARS:
+        text = text[:ARTICLE_MAX_CHARS].rsplit("\n", 1)[0] + "\n……（正文过长已截断，完整内容请看原文）"
     return text
 
 
@@ -119,6 +165,8 @@ def collect_news():
                 continue
             if item["published"] and item["published"] < cutoff:
                 continue
+            if SKIP_TITLE_PATTERN.search(item["title"]) or SKIP_LINK_PATTERN.search(item["link"]):
+                continue
             seen.update((key, item["link"]))
             text = f"{item['title']} {item['summary']}"
             if is_real_madrid or REAL_MADRID_PATTERN.search(text):
@@ -144,26 +192,48 @@ def translate_items(sections):
     for _, items in sections:
         for item in items:
             item["title_zh"] = translate(item["title"])
-            item["summary_zh"] = translate(item["summary"])
-            time.sleep(0.3)
+            body = fetch_article(item["link"])
+            item["full_text"] = bool(body)
+            # 提取不到正文时退回 RSS 简介
+            item["body_zh"] = translate_long(body or item["summary"])
+            print(f"{'正文' if body else '简介'} {len(body or item['summary'])} 字符: {item['title']}")
 
 
 def render_item(item):
     when = item["published"].astimezone(BEIJING).strftime("%m-%d %H:%M") if item["published"] else ""
     meta = " · ".join(p for p in (html.escape(item["source"]), when) if p)
-    summary = (
-        f'<p style="margin:4px 0;color:#444;font-size:14px">{html.escape(item["summary_zh"])}</p>'
-        if item["summary_zh"]
-        else ""
+    if not item["full_text"]:
+        meta += " · 仅简介，未能获取全文"
+    body = "".join(
+        f'<p style="margin:0 0 10px;color:#333;font-size:15px;line-height:1.7">{html.escape(p)}</p>'
+        for p in item["body_zh"].split("\n")
+        if p.strip()
     )
     return (
-        '<li style="margin:0 0 16px">'
-        f'<a href="{html.escape(item["link"])}" style="color:#1a56db;font-size:15px;'
+        '<div style="margin:0 0 28px;padding-bottom:20px;border-bottom:1px solid #eee">'
+        f'<a href="{html.escape(item["link"])}" style="color:#1a56db;font-size:17px;'
         f'text-decoration:none;font-weight:600">{html.escape(item["title_zh"])}</a>'
-        f'<div style="color:#999;font-size:12px;margin-top:2px">{html.escape(item["title"])}</div>'
-        f"{summary}"
-        f'<div style="color:#888;font-size:12px">{meta}</div>'
-        "</li>"
+        f'<div style="color:#999;font-size:12px;margin:2px 0 4px">{html.escape(item["title"])}</div>'
+        f'<div style="color:#888;font-size:12px;margin-bottom:10px">{meta}</div>'
+        f"{body}"
+        "</div>"
+    )
+
+
+def render_toc(sections):
+    """邮件开头的目录，点击跳到对应文章。"""
+    rows = []
+    for s, (name, items) in enumerate(sections):
+        for i, item in enumerate(items):
+            rows.append(
+                f'<li style="margin:2px 0"><a href="#a{s}-{i}" style="color:#333;text-decoration:none">'
+                f"<span style=\"color:#888\">[{name}]</span> {html.escape(item['title_zh'])}</a></li>"
+            )
+    if not rows:
+        return ""
+    return (
+        '<div style="background:#f6f8fa;padding:12px 16px;border-radius:6px;font-size:14px;margin-bottom:8px">'
+        f'<b>今日目录</b><ol style="padding-left:20px;margin:6px 0 0">{"".join(rows)}</ol></div>'
     )
 
 
@@ -173,11 +243,12 @@ def render_email(sections, today):
         f'<h2 style="margin:0 0 4px">⚽ 足球早报 · {today}</h2>',
         f'<p style="color:#888;font-size:12px;margin:0 0 16px">过去 {LOOKBACK_HOURS} 小时的外媒新闻，'
         "机器翻译，点击标题阅读英文原文</p>",
+        render_toc(sections),
     ]
-    for name, items in sections:
-        parts.append(f'<h3 style="border-left:4px solid #1a56db;padding-left:8px">{name}</h3>')
+    for s, (name, items) in enumerate(sections):
+        parts.append(f'<h3 style="border-left:4px solid #1a56db;padding-left:8px;margin-top:24px">{name}</h3>')
         if items:
-            parts.append('<ul style="padding-left:18px">' + "".join(render_item(i) for i in items) + "</ul>")
+            parts.extend(f'<a name="a{s}-{i}"></a>{render_item(item)}' for i, item in enumerate(items))
         else:
             parts.append('<p style="color:#888">暂无新消息</p>')
     parts.append("</div>")
