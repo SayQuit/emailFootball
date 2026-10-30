@@ -73,7 +73,7 @@ SECTIONS = [
             ("The Guardian", "https://www.theguardian.com/football/world-cup-2026/rss"),
         ],
         "keywords": r"world cup|nations league|international break|national team|qualif|"
-        r"\bfriendl(?:y|ies)\b|euro 20\d\d|copa am[eé]rica|afcon|three lions|lionesses",
+        r"\bfriendl(?:y|ies)\b|euro 20\d\d|copa am[eé]rica|afcon|three lions",
     },
     {
         "name": "欧冠资讯",
@@ -115,11 +115,11 @@ SECTIONS = [
         # 国内足球新闻少，放宽时间范围
         "lookback_hours": 48,
         # 中新网体育频道包含所有项目，只保留足球
-        "filter": r"足球|中超|中甲|国足|男足|女足|足协|世预赛|亚冠|亚洲杯",
+        "filter": r"足球|中超|中甲|国足|男足|足协|世预赛|亚冠|亚洲杯",
         "feeds": [
             ("中新网", "https://www.chinanews.com.cn/rss/sports.xml"),
             # 补充来源：只有能解析出真实文章地址的条目才会保留
-            ("Google 新闻", google_news_cn("中超 OR 国足 OR 中国男足 OR 中国女足")),
+            ("Google 新闻", google_news_cn("中超 OR 国足 OR 中国男足")),
         ],
         "keywords": None,
     },
@@ -128,6 +128,14 @@ SECTIONS = [
 # 论坛帖、直播文字流、视频和播客没有可读的正文，直接跳过
 SKIP_TITLE_PATTERN = re.compile(r"\bthread\b|– podcast$", re.IGNORECASE)
 SKIP_LINK_PATTERN = re.compile(r"/live/|/videos?/|/audio/")
+
+# 不要女足新闻：标题、简介或链接命中任意一个词就跳过
+WOMEN_PATTERN = re.compile(
+    r"女足|女子|女超|女甲|铿锵玫瑰|"
+    r"\bwomen|\bwoman\b|\bfemale\b|\bgirls?\b|\bwsl\b|\bnwsl\b|liga f\b|lionesses|matildas|"
+    r"womensfootball|womens-",
+    re.IGNORECASE,
+)
 
 # 文章页面 <meta property="og:image" content="..."> 里的题图，两种属性顺序都要匹配
 OG_IMAGE_PATTERN = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', re.IGNORECASE)
@@ -288,6 +296,7 @@ def collect_news():
             and not (item["published"] and item["published"] < cutoff)
             and not SKIP_TITLE_PATTERN.search(item["title"])
             and not SKIP_LINK_PATTERN.search(item["link"])
+            and not WOMEN_PATTERN.search(f"{item['title']} {item['summary']} {item['link']}")
         )
 
     for section in sorted(SECTIONS, key=lambda s: s["priority"]):
