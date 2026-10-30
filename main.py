@@ -112,7 +112,13 @@ SECTIONS = [
         "priority": 6,
         "limit": 5,
         "translate": False,
+        # 国内足球新闻少，放宽时间范围
+        "lookback_hours": 48,
+        # 中新网体育频道包含所有项目，只保留足球
+        "filter": r"足球|中超|中甲|国足|男足|女足|足协|世预赛|亚冠|亚洲杯",
         "feeds": [
+            ("中新网", "https://www.chinanews.com.cn/rss/sports.xml"),
+            # 补充来源：只有能解析出真实文章地址的条目才会保留
             ("Google 新闻", google_news_cn("中超 OR 国足 OR 中国男足 OR 中国女足")),
         ],
         "keywords": None,
@@ -126,6 +132,8 @@ SKIP_LINK_PATTERN = re.compile(r"/live/|/videos?/|/audio/")
 # 文章页面 <meta property="og:image" content="..."> 里的题图，两种属性顺序都要匹配
 OG_IMAGE_PATTERN = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', re.IGNORECASE)
 OG_IMAGE_REVERSED_PATTERN = re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', re.IGNORECASE)
+# 网站 logo、Google 新闻占位图等不是新闻配图
+BAD_IMAGE_PATTERN = re.compile(r"gstatic\.com|googleusercontent\.com|news\.google\.com|logo", re.IGNORECASE)
 
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
@@ -216,7 +224,7 @@ def fetch_article(url):
 
     match = OG_IMAGE_PATTERN.search(downloaded) or OG_IMAGE_REVERSED_PATTERN.search(downloaded)
     image = html.unescape(match.group(1)) if match else ""
-    if not image.startswith("http"):
+    if not image.startswith("http") or BAD_IMAGE_PATTERN.search(image):
         image = ""
 
     text = text or ""
@@ -231,7 +239,7 @@ def feed_image(entry):
     candidates += [
         {"url": l.get("href")} for l in entry.get("links", []) if l.get("type", "").startswith("image/")
     ]
-    candidates = [c for c in candidates if c.get("url")]
+    candidates = [c for c in candidates if c.get("url") and not BAD_IMAGE_PATTERN.search(c["url"])]
     if not candidates:
         return ""
     return max(candidates, key=lambda c: int(c.get("width") or 0))["url"]
@@ -266,11 +274,12 @@ def fetch_feed(source, url):
 
 
 def collect_news():
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    """为每个栏目选出候选新闻。候选数量是上限的两倍，给后面解析失败被丢弃的条目留余量。"""
+    now = datetime.now(timezone.utc)
     seen = set()
     picked = {}
 
-    def usable(item):
+    def usable(item, cutoff):
         key = normalize(item["title"])
         return (
             key
@@ -282,7 +291,11 @@ def collect_news():
         )
 
     for section in sorted(SECTIONS, key=lambda s: s["priority"]):
+        cutoff = now - timedelta(hours=section.get("lookback_hours", LOOKBACK_HOURS))
         candidates = [dict(i) for source, url in section["feeds"] for i in fetch_feed(source, url)]
+        if section.get("filter"):
+            pattern = re.compile(section["filter"], re.IGNORECASE)
+            candidates = [i for i in candidates if pattern.search(f"{i['title']} {i['summary']}")]
         if section["keywords"]:
             pattern = re.compile(section["keywords"], re.IGNORECASE)
             candidates += [
@@ -294,9 +307,9 @@ def collect_news():
 
         items = []
         for item in sorted(candidates, key=lambda i: i["published"] or cutoff, reverse=True):
-            if len(items) >= section["limit"]:
+            if len(items) >= section["limit"] * 2:
                 break
-            if usable(item):
+            if usable(item, cutoff):
                 seen.update((normalize(item["title"]), item["link"]))
                 items.append(item)
         picked[section["name"]] = items
@@ -305,10 +318,16 @@ def collect_news():
 
 
 def prepare_items(sections):
-    """抓取正文和图片，外媒新闻翻译成中文。"""
+    """抓取正文和图片，外媒新闻翻译成中文。每个栏目保留前 limit 条成功处理的新闻。"""
     for section, items in sections:
+        kept = []
         for item in items:
+            if len(kept) >= section["limit"]:
+                break
             item["link"] = resolve_google_news(item["link"])
+            if "news.google.com" in item["link"]:
+                print(f"[{section['name']}] 跳过（无法获取真实链接）: {item['title']}")
+                continue
             body, image = fetch_article(item["link"])
             item["full_text"] = bool(body)
             item["image"] = image or item["image"]
@@ -322,6 +341,8 @@ def prepare_items(sections):
                 item["title"] = ""  # 中文新闻不重复显示原标题
                 item["body_zh"] = body
             print(f"[{section['name']}] {'正文' if item['full_text'] else '简介'} {len(body)} 字符: {item['title_zh']}")
+            kept.append(item)
+        items[:] = kept
 
 
 def render_item(item, anchor):
