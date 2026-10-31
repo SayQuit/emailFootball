@@ -2,8 +2,8 @@ name: Daily Football News Email
 
 on:
   schedule:
-    # 每天北京时间 05:00（UTC 前一天 21:00）。GitHub 定时任务高峰期可能延迟几分钟到几十分钟
-    - cron: "0 21 * * *"
+    # 每天北京时间 06:47（UTC 前一天 22:47）。用非整点避开 GitHub 定时任务高峰，仍可能延迟几分钟到几十分钟
+    - cron: "47 22 * * *"
   workflow_dispatch:
 
 permissions:
