@@ -167,7 +167,8 @@ def deepseek(system, user, max_tokens=800):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     for attempt in range(3):
         try:
-            with urlopen(Request(DEEPSEEK_URL, data=body, headers=headers), timeout=90) as resp:
+            # 全文翻译输出较长，超时留足
+            with urlopen(Request(DEEPSEEK_URL, data=body, headers=headers), timeout=240) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             return json.loads(data["choices"][0]["message"]["content"])
         except Exception as e:
@@ -278,25 +279,30 @@ def summarize(item):
     # 卫报的 og:image 是带签名的大图，优先用 RSS 里的小图
     item["image"] = small_image(item["image"] if "guim.co.uk" in item["image"] else (og_image or item["image"]))
 
+    text = body or item["summary"]
     prompt = (
         f"媒体：{item['source']}\n英文标题：{item['title']}\n"
-        f"正文：\n{body or item['summary']}\n\n"
-        "请输出 JSON：{\"title\": \"中文标题，一句话说清是什么事，不超过 30 字\", "
-        "\"summary\": \"1–2 句中文摘要，50–90 字，只讲最关键的事实、比分或数据\"}。"
+        f"正文：\n{text}\n\n"
+        "请输出 JSON：{\"title\": \"简短的中文标题，不超过 20 字\", "
+        "\"summary\": \"1–2 句中文摘要，50–90 字，只讲最关键的事实、比分或数据\", "
+        "\"paragraphs\": [\"把正文完整翻译成通顺的中文，按原文分段，每段一个字符串；"
+        "去掉与新闻无关的内容（广告、评论区规则、相关链接、图片说明）\"]}。"
         "如果这不是一条足球新闻（例如节目预告、竞猜、问答、广告），只输出 {\"skip\": true}。"
     )
-    result = deepseek(EDITOR_RULES, prompt)
+    result = deepseek(EDITOR_RULES, prompt, max_tokens=6000)
     if result and result.get("skip"):
         print(f"跳过（非新闻）: {item['title']}")
         return None
     if result and result.get("title") and result.get("summary"):
         item["title_zh"], item["summary_zh"] = result["title"].strip(), result["summary"].strip()
+        item["paragraphs"] = [p.strip() for p in result.get("paragraphs") or [] if isinstance(p, str) and p.strip()]
     else:
         # DeepSeek 拒绝或失败时退回机器翻译，保证邮件照常发出
         print(f"改用机器翻译: {item['title']}")
         item["title_zh"] = google_translate(item["title"])
-        first = re.split(r"(?<=[.!?])\s", body or item["summary"], maxsplit=2)
+        first = re.split(r"(?<=[.!?])\s", text, maxsplit=2)
         item["summary_zh"] = google_translate(" ".join(first[:2])[:400])
+        item["paragraphs"] = [google_translate(p) for p in text.split("\n") if len(p.strip()) > 40][:15]
     return item
 
 
@@ -401,14 +407,27 @@ def render_card(n, item):
         'style="display:block;width:104px;height:104px;object-fit:cover;border-radius:12px;border:0"></td>'
         if item["image"] else ""
     )
+    # 全文放在 <details> 里，点击展开；不支持 <details> 的邮箱会直接显示全文
+    full_text = "".join(
+        f'<p style="margin:0 0 10px;color:#3a3f47;font-size:14px;line-height:1.8">{html.escape(p)}</p>'
+        for p in item.get("paragraphs", [])
+    )
+    details = (
+        '<details style="margin:10px 0 0">'
+        '<summary style="cursor:pointer;color:#1a56db;font-size:13px">展开全文</summary>'
+        f'<div style="margin-top:10px;padding:12px 14px;background:#f6f8fa;border-radius:8px">{full_text}</div>'
+        "</details>"
+        if full_text else ""
+    )
     return (
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 22px">'
         f"<tr>{image}<td valign=\"top\">"
-        f'<a href="{html.escape(item["link"])}" style="color:#1d2129;text-decoration:none;font-size:16px;'
-        f'font-weight:700;line-height:1.45">{n}. {html.escape(item["title_zh"])}</a>'
+        f'<div style="color:#1d2129;font-size:16px;font-weight:700;line-height:1.45">{n}. {html.escape(item["title_zh"])}</div>'
         f'<div style="color:#3a3f47;font-size:14px;line-height:1.7;margin:6px 0">{html.escape(item["summary_zh"])}</div>'
         f'<div style="color:#86909c;font-size:12px">来源：{html.escape(item["source"])}{date}</div>'
-        "</td></tr></table>"
+        "</td></tr>"
+        f'<tr><td colspan="2">{details}</td></tr>'
+        "</table>"
     )
 
 
@@ -458,7 +477,7 @@ def render_email(items, groups, focus, today):
     parts = [
         f'<div style="font-family:{FONT};max-width:680px;margin:auto;color:#1d2129">',
         f'<h1 style="font-size:22px;margin:0 0 4px">⚽ 足球简报 · {today}</h1>',
-        f'<p style="color:#86909c;font-size:12px;margin:0">过去 {LOOKBACK_HOURS} 小时的外媒新闻，点击标题阅读原文</p>',
+        f'<p style="color:#86909c;font-size:12px;margin:0">过去 {LOOKBACK_HOURS} 小时的外媒新闻，点击「展开全文」查看完整内容</p>',
     ]
     n = 0
     for key, title in SECTIONS:
