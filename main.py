@@ -4,8 +4,7 @@
     一、皇家马德里及西甲
     二、英超焦点新闻
     三、国际足坛其他新闻
-    四、未来几天值得关注的比赛（按赛事分组，带赛事图标和队徽）
-    五、我建议重点关注的事
+    四、未来一周的豪门对决（西甲、英超、欧冠，带赛事图标和队徽）
 
 环境变量:
     QQ_EMAIL          发件 QQ 邮箱地址
@@ -41,7 +40,7 @@ BEIJING = timezone(timedelta(hours=8))
 LOOKBACK_HOURS = 26  # 比 24 小时略长，抵消 GitHub 定时任务的延迟
 MAX_ARTICLES = 45  # 控制运行时间和 API 费用
 ARTICLE_MAX_CHARS = 6000
-FIXTURE_DAYS = 3
+FIXTURE_DAYS = 7  # 只看豪门对决，场次少，所以看一周
 WORKERS = 5
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
@@ -99,20 +98,16 @@ LEAGUES = [
     ("esp.1", "西甲"),
     ("eng.1", "英超"),
     ("uefa.champions", "欧冠"),
-    ("uefa.europa", "欧联杯"),
-    ("uefa.europa.conf", "欧协联"),
-    ("ger.1", "德甲"),
-    ("ita.1", "意甲"),
-    ("fra.1", "法甲"),
-    ("esp.copa_del_rey", "国王杯"),
-    ("eng.league_cup", "英格兰联赛杯"),
-    ("eng.fa", "足总杯"),
-    ("uefa.nations", "欧国联"),
-    ("fifa.friendly", "国际友谊赛"),
-    ("fifa.worldq.uefa", "世预赛欧洲区"),
-    ("fifa.worldq.conmebol", "世预赛南美区"),
 ]
 REAL_MADRID_ESPN_ID = "86"
+# 赛程只列豪门之间的对决（皇马的比赛总是列出）。ESPN 球队 ID
+BIG_CLUBS = {
+    "86", "83", "1068",                   # 皇马、巴萨、马竞
+    "359", "363", "364", "382", "360", "367",  # 阿森纳、切尔西、利物浦、曼城、曼联、热刺
+    "132", "124", "131",                  # 拜仁、多特蒙德、勒沃库森
+    "111", "110", "103", "114",           # 尤文、国米、AC米兰、那不勒斯
+    "160",                                # 巴黎圣日耳曼
+}
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 EDITOR_RULES = (
@@ -311,21 +306,18 @@ def summarize_all(items):
         return [i for i in pool.map(summarize, items) if i]
 
 
-def pick_focus(items):
-    """去掉同一事件的重复报道，并挑出今天最值得关注的事。"""
+def drop_duplicates(items):
+    """去掉报道同一事件的重复条目。"""
     listing = "\n".join(f"{n}. {i['title_zh']}：{i['summary_zh']}" for n, i in enumerate(items))
     prompt = (
         f"以下是今天的足球新闻（编号. 标题：摘要）：\n{listing}\n\n"
-        "请输出 JSON：{\"duplicates\": [报道同一事件、应当删掉的较差条目编号], "
-        "\"focus\": [{\"keyword\": \"关键词，2–8 字\", \"reason\": \"一句话说明为什么值得关注\"}]}。"
-        "focus 挑今天最值得跟进的事，条数不固定，有几件写几件。这一部分可以有你的判断。"
+        "请输出 JSON：{\"duplicates\": [报道同一事件、应当删掉的较差条目编号]}。没有重复就输出空列表。"
     )
-    result = deepseek(EDITOR_RULES, prompt, max_tokens=1500) or {}
+    result = deepseek(EDITOR_RULES, prompt, max_tokens=500) or {}
     drop = {d for d in result.get("duplicates", []) if isinstance(d, int)}
-    kept = [i for n, i in enumerate(items) if n not in drop]
     if drop:
         print(f"合并重复报道 {len(drop)} 条")
-    return kept, result.get("focus", [])
+    return [i for n, i in enumerate(items) if n not in drop]
 
 
 # ---------- 赛程 ----------
@@ -364,11 +356,14 @@ def collect_fixtures():
                 continue
             teams = {c["homeAway"]: c["team"] for c in e["competitions"][0]["competitors"]}
             home, away = teams.get("home", {}), teams.get("away", {})
+            ids = {home.get("id"), away.get("id")}
+            if REAL_MADRID_ESPN_ID not in ids and not ids <= BIG_CLUBS:
+                continue
             matches.append({
                 "kickoff": kickoff,
                 "home": home.get("displayName", ""), "home_logo": home.get("logo", ""),
                 "away": away.get("displayName", ""), "away_logo": away.get("logo", ""),
-                "madrid": REAL_MADRID_ESPN_ID in (home.get("id"), away.get("id")),
+                "madrid": REAL_MADRID_ESPN_ID in ids,
             })
         if matches:
             groups.append({"name": name, "logo": logo, "matches": sorted(matches, key=lambda m: m["kickoff"])})
@@ -433,7 +428,7 @@ def render_card(n, item):
 
 def render_fixtures(groups):
     if not groups:
-        return '<p style="color:#86909c">未来几天暂无比赛数据。</p>'
+        return '<p style="color:#86909c">未来一周西甲、英超、欧冠没有豪门对决。</p>'
     parts = ['<p style="color:#3a3f47;font-size:14px;margin:0 0 10px">以下均为北京时间：</p>']
     for g in groups:
         icon = f'<img src="{espn_icon(g["logo"], 22)}" width="22" height="22" alt="" style="vertical-align:middle;margin-right:6px;border:0">' if g["logo"] else ""
@@ -459,21 +454,11 @@ def render_fixtures(groups):
     return "".join(parts)
 
 
-def render_focus(focus):
-    if not focus:
-        return '<p style="color:#86909c">暂无。</p>'
-    rows = "".join(
-        f'<li style="margin:0 0 8px"><b>{html.escape(str(f.get("keyword", "")))}</b>：{html.escape(str(f.get("reason", "")))}</li>'
-        for f in focus if isinstance(f, dict)
-    )
-    return f'<ol style="padding-left:20px;margin:0;font-size:14px;line-height:1.7;color:#1d2129">{rows}</ol>'
-
-
 def section_title(text):
     return f'<h2 style="font-size:19px;margin:30px 0 16px;color:#1d2129">{text}</h2>'
 
 
-def render_email(items, groups, focus, today):
+def render_email(items, groups, today):
     parts = [
         f'<div style="font-family:{FONT};max-width:680px;margin:auto;color:#1d2129">',
         f'<h1 style="font-size:22px;margin:0 0 4px">⚽ 足球简报 · {today}</h1>',
@@ -491,10 +476,8 @@ def render_email(items, groups, focus, today):
         for item in section_items:
             n += 1
             parts.append(render_card(n, item))
-    parts.append(section_title("四、未来几天值得关注的比赛"))
+    parts.append(section_title("四、未来一周的豪门对决"))
     parts.append(render_fixtures(groups))
-    parts.append(section_title("五、我建议重点关注的事"))
-    parts.append(render_focus(focus))
     parts.append("</div>")
     return "".join(parts)
 
@@ -523,13 +506,12 @@ def main():
     items = collect_news()
     if not items:
         sys.exit("没有抓到任何新闻，请检查新闻源")
-    items = summarize_all(items)
-    items, focus = pick_focus(items)
+    items = drop_duplicates(summarize_all(items))
 
     groups = collect_fixtures()
     translate_team_names(groups)
 
-    body = render_email(items, groups, focus, today)
+    body = render_email(items, groups, today)
     subject = f"⚽ 足球简报 {today}"
 
     if dry_run:
