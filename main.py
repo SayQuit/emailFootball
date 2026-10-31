@@ -11,7 +11,7 @@
     二、英超焦点新闻
     三、国际足坛其他新闻
     四、中国足球
-    五、未来一周赛程（西甲/英超/欧冠豪门对决、中超、中国各级国家队）
+    五、近期赛程（一周内西甲/英超/欧冠豪门对决、中超未来 3 轮、中国各级国家队、重要大赛）
 
 环境变量:
     QQ_EMAIL          发件 QQ 邮箱地址
@@ -104,23 +104,41 @@ SEARCH_SECTIONS = [
     ("world", 5, ["Champions League OR national team football lang:en", "Serie A OR Bundesliga OR Ligue 1 lang:en"]),
     ("china", 12, [
         "中超 lang:zh",
-        "国足 lang:zh",
-        "U23国足 OR 国奥 lang:zh",
-        "U21国足 OR U20国足 OR U17国足 lang:zh",
         "中甲 lang:zh",
     ]),
 ]
+
+# 重点关注的话题：这些新闻不受条数上限限制，排在所在栏目最前面，并标「重点」
+PRIORITY_SEARCHES = [
+    ("world", "Cristiano Ronaldo OR Al Nassr lang:en"),
+    ("madrid", "Mbappe lang:en"),
+    ("china", "国足 lang:zh"),
+    ("china", "U23国足 OR 国奥 lang:zh"),
+    ("china", "U21国足 OR U20国足 OR U19国足 OR U17国足 OR U15国足 lang:zh"),
+    ("china", "中国 年轻球员 OR 新星 OR 小将 OR 留洋 足球 lang:zh"),
+]
+PRIORITY_LIMIT_PER_QUERY = 6
+PRIORITY_PATTERN = re.compile(
+    r"ronaldo|al[- ]?nassr|mbapp[eé]|C罗|罗纳尔多|利雅得胜利|姆巴佩|国足|国奥|中国男足|U\d\d国足|留洋|小将|新星",
+    re.IGNORECASE,
+)
+PRIORITY_TOPICS = "C罗、利雅得胜利、姆巴佩、中国男足各级国家队（国足、国奥、U23、U21、U20、U17 等）、中国年轻潜力球员"
 
 # 赛程搜索词。搜索结果交给 DeepSeek 提取未来一周的比赛
 FIXTURE_QUERIES = [
     "西甲 赛程 北京时间",
     "英超 赛程 北京时间",
     "欧冠 赛程 北京时间",
-    "中超 赛程 北京时间",
+    "中超 赛程 轮次 北京时间",
+    "中超 下一轮 对阵",
     "国足 比赛 时间 对手",
     "U23国足 OR 国奥 比赛 赛程",
-    "U21国足 OR U20国足 OR U17国足 比赛 赛程",
+    "U21国足 OR U20国足 OR U19国足 OR U17国足 比赛 赛程",
+    # 正在进行或即将开始的重要大赛
+    "世界杯 OR 欧洲杯 OR 亚洲杯 OR 美洲杯 OR 非洲杯 赛程 北京时间",
+    "U23亚洲杯 OR 世青赛 OR 世少赛 OR 奥运会男足 赛程",
 ]
+FIXTURE_LOOKAHEAD_DAYS = 90  # 中超 3 轮、国家队比赛、大赛可能在一周之后，提取范围放宽到三个月
 BIG_CLUBS = "皇马、巴萨、马竞、阿森纳、切尔西、利物浦、曼城、曼联、热刺、拜仁、多特蒙德、勒沃库森、尤文、国米、AC米兰、那不勒斯、巴黎圣日耳曼"
 
 # 赛程里的图标：ESPN 的公开图片（只是图片地址，不调用它的接口）
@@ -291,10 +309,14 @@ def collect_foreign_news(seen):
                 continue
             seen.update((key, item["link"]))
             item["section"] = classify(item, hint)
+            item["priority"] = bool(PRIORITY_PATTERN.search(f"{item['title']} {item['summary']}"))
             items.append(item)
-    items.sort(key=lambda i: i["published"], reverse=True)
-    print(f"外媒新闻 {len(items)} 条，处理最新的 {min(len(items), MAX_FOREIGN_ARTICLES)} 条")
-    return items[:MAX_FOREIGN_ARTICLES]
+    # 重点话题全部保留，其余按时间取最新的
+    priority = [i for i in items if i["priority"]]
+    others = sorted((i for i in items if not i["priority"]), key=lambda i: i["published"], reverse=True)
+    kept = priority + others[:max(0, MAX_FOREIGN_ARTICLES - len(priority))]
+    print(f"外媒新闻 {len(items)} 条，保留 {len(kept)} 条（重点 {len(priority)} 条）")
+    return kept
 
 
 def fetch_article(url):
@@ -314,38 +336,50 @@ def fetch_article(url):
     return (text or "")[:ARTICLE_MAX_CHARS], image
 
 
-def collect_search_news(seen):
-    """用 DeepSeek 搜索：给外媒栏目补充 RSS 没有的新闻，并找中国足球新闻。
-    只保留时间范围内、相关度够高、有正文的结果；seen 里已有的（RSS 已收录的）跳过。"""
+def search_news(query, section, seen, priority=False):
+    """搜索一个词，只保留时间范围内、相关度够高、有正文、seen 里没有的结果，按相关度排序。"""
     after = (datetime.now(BEIJING) - timedelta(days=2)).strftime("%Y-%m-%d")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    found = []
+    for r in search(f"{query} after:{after}"):
+        published = parse_date(r.get("date"))
+        title_key = normalize(r.get("title"))
+        if not published or published < cutoff:
+            continue
+        if (r.get("rerank_score") or 0) < MIN_RERANK_SCORE or len(r.get("content") or "") < 300:
+            continue
+        if r.get("url") in seen or title_key in seen or SKIP_URL_PATTERN.search(r.get("url", "")):
+            continue
+        seen.update((r.get("url"), title_key))
+        found.append({
+            "section": section,
+            "title": r.get("title", ""),
+            "source": r.get("site_name") or urlsplit(r.get("url", "")).hostname or "",
+            "published": published,
+            "content": (r.get("content") or "")[:ARTICLE_MAX_CHARS],
+            "image": first_image(r.get("content")),
+            "score": r.get("rerank_score") or 0,
+            "priority": priority or bool(PRIORITY_PATTERN.search(r.get("title", ""))),
+        })
+    # 相关度高的优先，再按时间
+    return sorted(found, key=lambda i: (i["score"], i["published"]), reverse=True)
+
+
+def collect_search_news(seen):
+    """用 DeepSeek 搜索：先搜重点话题，再给外媒栏目补充 RSS 没有的新闻，并找中国足球新闻。
+    seen 里已有的（RSS 已收录的）跳过。"""
     items = []
-    for key, limit, queries in SEARCH_SECTIONS:
-        candidates = []
-        for query in queries:
-            for r in search(f"{query} after:{after}"):
-                published = parse_date(r.get("date"))
-                title_key = normalize(r.get("title"))
-                if not published or published < cutoff:
-                    continue
-                if (r.get("rerank_score") or 0) < MIN_RERANK_SCORE or len(r.get("content") or "") < 300:
-                    continue
-                if r.get("url") in seen or title_key in seen or SKIP_URL_PATTERN.search(r.get("url", "")):
-                    continue
-                seen.update((r.get("url"), title_key))
-                candidates.append({
-                    "section": key,
-                    "title": r.get("title", ""),
-                    "source": r.get("site_name") or urlsplit(r.get("url", "")).hostname or "",
-                    "published": published,
-                    "content": (r.get("content") or "")[:ARTICLE_MAX_CHARS],
-                    "image": first_image(r.get("content")),
-                    "score": r.get("rerank_score") or 0,
-                })
-        # 相关度高的优先，再按时间
+    for section, query in PRIORITY_SEARCHES:
+        found = search_news(query, section, seen, priority=True)[:PRIORITY_LIMIT_PER_QUERY]
+        items.extend(found)
+        print(f"[重点] {query}: {len(found)} 条")
+    for section, limit, queries in SEARCH_SECTIONS:
+        candidates = [i for q in queries for i in search_news(q, section, seen)]
         candidates.sort(key=lambda i: (i["score"], i["published"]), reverse=True)
-        items.extend(candidates[:limit])
-        print(f"[{key}] 搜索补充 {min(len(candidates), limit)} 条（候选 {len(candidates)} 条）")
+        # 搜到的重点话题不占条数
+        kept = [i for i in candidates if i["priority"]] + [i for i in candidates if not i["priority"]][:limit]
+        items.extend(kept)
+        print(f"[{section}] 搜索补充 {len(kept)} 条（候选 {len(candidates)} 条）")
     return items
 
 
@@ -367,6 +401,7 @@ def summarize(item):
         "请输出 JSON：{\"title\": \"简短的中文标题，不超过 20 字\", "
         "\"summary\": \"1–2 句中文摘要，50–90 字，只讲最关键的事实、比分或数据\", "
         "\"source\": \"媒体名称，如 BBC Sport、卫报、ESPN、马卡报、新浪体育\", "
+        f"\"priority\": 这条新闻是否主要关于{PRIORITY_TOPICS}（true 或 false）, "
         "\"paragraphs\": [\"正文整理成通顺的中文全文（英文原文就完整翻译，中文原文就保留原文措辞），"
         "按原文分段，每段一个字符串；去掉与新闻无关的内容（广告、导航、评论区、相关链接、图片说明、版权声明）\"]}。"
         "如果这不是一条足球新闻报道（例如赛程表、节目预告、竞猜、问答、广告、球队主页），"
@@ -379,6 +414,7 @@ def summarize(item):
     item["title_zh"], item["summary_zh"] = result["title"].strip(), result["summary"].strip()
     item["source"] = str(result.get("source") or item["source"]).strip()
     item["paragraphs"] = [p.strip() for p in result.get("paragraphs") or [] if isinstance(p, str) and p.strip()]
+    item["priority"] = item.get("priority") or result.get("priority") is True
     return item
 
 
@@ -404,11 +440,12 @@ def drop_duplicates(items):
 # ---------- 赛程 ----------
 
 def collect_fixtures():
-    """搜索赛程资料，让 DeepSeek 提取未来一周的比赛，按赛事分组。"""
+    """搜索赛程资料，让 DeepSeek 提取接下来的比赛，按赛事分组。"""
     now = datetime.now(BEIJING)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=FIXTURE_DAYS)
-    after = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+    end = start + timedelta(days=FIXTURE_LOOKAHEAD_DAYS)
+    week_end = start + timedelta(days=FIXTURE_DAYS - 1)
+    after = (now - timedelta(days=30)).strftime("%Y-%m-%d")
 
     sources = []
     for query in FIXTURE_QUERIES:
@@ -417,18 +454,21 @@ def collect_fixtures():
 
     result = chat(
         f"今天是北京时间 {now:%Y-%m-%d %A}。以下是搜索到的赛程资料：\n\n" + "\n\n".join(sources) + "\n\n"
-        f"请从资料中提取 {start:%Y-%m-%d} 到 {(end - timedelta(days=1)):%Y-%m-%d} 之间（北京时间）的比赛，输出 JSON：\n"
+        "请从资料中提取今天及以后的比赛（北京时间），输出 JSON：\n"
         "{\"groups\": [{\"name\": \"赛事组名\", \"matches\": [{\"date\": \"YYYY-MM-DD\", \"time\": \"HH:MM，北京时间，不确定就写待定\", "
-        "\"home\": \"主队\", \"away\": \"客队\", \"note\": \"赛事或轮次，可留空\"}]}]}\n"
+        "\"home\": \"主队\", \"away\": \"客队\", \"note\": \"轮次或赛事名，可留空\"}]}]}\n"
         "分组规则（按这个顺序，没有比赛的组不要输出）：\n"
-        f"1. 西甲、英超、欧冠：每项赛事一组，组名就叫「西甲」「英超」「欧冠」。只列两队都属于这些豪门的对决：{BIG_CLUBS}；"
-        "皇马的比赛不论对手都要列出。\n"
-        "2. 中超：一组，组名「中超」，列出全部比赛。\n"
-        "3. 中国各级男子国家队（国足、国奥、U23、U21、U20、U17 等）：一组，组名「中国国家队」，"
-        "home 写我方球队（如「国足」「U23国足」），away 写对手，note 写赛事名。\n"
-        f"球队名请用中文简称，豪门统一写成：{BIG_CLUBS}。\n"
+        f"1. 西甲、英超、欧冠：每项赛事一组，组名就叫「西甲」「英超」「欧冠」，只列 {start:%Y-%m-%d} 到 {week_end:%Y-%m-%d} 之间的比赛。"
+        f"只列两队都属于这些豪门的对决：{BIG_CLUBS}；皇马的比赛不论对手都要列出。\n"
+        "2. 中超：一组，组名「中超」，列出接下来 3 个比赛日（3 轮）的全部比赛，note 写第几轮。赛季已经结束就不输出这一组。\n"
+        f"3. 中国各级男子国家队（国足、国奥、U23、U21、U20、U19、U17 等）：一组，组名「中国国家队」，"
+        f"列出 {(end - timedelta(days=1)):%Y-%m-%d} 之前的全部比赛；home 写我方球队（如「国足」「U23国足」），away 写对手，note 写赛事名。\n"
+        "4. 重要大赛（世界杯、欧洲杯、亚洲杯、美洲杯、非洲杯、U23亚洲杯、世青赛、奥运会男足等）：如果正在进行，或者三个月内开始，"
+        f"每项大赛一组，组名用大赛名称（如「2027亚洲杯」），列出 {(start + timedelta(days=13)):%Y-%m-%d} 之前的比赛；"
+        "还没到比赛日期的，列出开幕后的前几场比赛。已经结束的大赛不要输出。\n"
+        f"球队名请用中文简称，豪门统一写成：{BIG_CLUBS}；中国男足成年队写「国足」。\n"
         "只列资料里明确写了日期的比赛，资料互相矛盾或看不出日期的不要列，不要凭记忆补充。",
-        max_tokens=4000,
+        max_tokens=6000,
     ) or {}
 
     groups = []
@@ -479,6 +519,11 @@ def team_icon(name):
 
 def render_card(n, item):
     when = item["published"].astimezone(BEIJING)
+    tag = (
+        '<span style="display:inline-block;background:#f53f3f;color:#fff;font-size:11px;font-weight:600;'
+        'padding:1px 6px;border-radius:4px;margin-right:6px;vertical-align:2px">重点</span>'
+        if item.get("priority") else ""
+    )
     image = (
         f'<td width="104" valign="top" style="padding:0 14px 0 0">'
         f'<img src="{html.escape(item["image"])}" width="104" height="104" alt="" '
@@ -500,7 +545,7 @@ def render_card(n, item):
     return (
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 22px">'
         f"<tr>{image}<td valign=\"top\">"
-        f'<div style="color:#1d2129;font-size:16px;font-weight:700;line-height:1.45">{n}. {html.escape(item["title_zh"])}</div>'
+        f'<div style="color:#1d2129;font-size:16px;font-weight:700;line-height:1.45">{n}. {tag}{html.escape(item["title_zh"])}</div>'
         f'<div style="color:#3a3f47;font-size:14px;line-height:1.7;margin:6px 0">{html.escape(item["summary_zh"])}</div>'
         f'<div style="color:#86909c;font-size:12px">来源：{html.escape(item["source"])}，{when.month}月{when.day}日</div>'
         "</td></tr>"
@@ -511,7 +556,7 @@ def render_card(n, item):
 
 def render_fixtures(groups):
     if not groups:
-        return '<p style="color:#86909c">未找到未来一周的相关赛程。</p>'
+        return '<p style="color:#86909c">未找到近期的相关赛程。</p>'
     cell = "padding:6px 8px;border-bottom:1px solid #eee"
     parts = ['<p style="color:#3a3f47;font-size:14px;margin:0 0 10px">以下均为北京时间：</p>']
     for g in groups:
@@ -554,13 +599,15 @@ def render_email(items, groups, today):
         if key == "madrid":
             # 皇马新闻排在其他西甲新闻前面
             section_items.sort(key=lambda i: "皇马" not in i["title_zh"] and "皇家马德里" not in i["title_zh"])
+        # 重点话题排在最前面（sort 是稳定的，上面的顺序在组内保留）
+        section_items.sort(key=lambda i: not i.get("priority"))
         parts.append(section_title(title))
         if not section_items:
             parts.append('<p style="color:#86909c">暂无新消息。</p>')
         for item in section_items:
             n += 1
             parts.append(render_card(n, item))
-    parts.append(section_title("五、未来一周赛程"))
+    parts.append(section_title("五、近期赛程"))
     parts.append(render_fixtures(groups))
     parts.append("</div>")
     return "".join(parts)
