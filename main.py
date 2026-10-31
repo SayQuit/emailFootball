@@ -108,7 +108,7 @@ SEARCH_SECTIONS = [
     ]),
 ]
 
-# 重点关注的话题：这些新闻不受条数上限限制，排在所在栏目最前面，并标「重点」
+# 重点关注的话题：这些新闻不受条数上限限制，排在所在栏目最前面
 PRIORITY_SEARCHES = [
     ("world", "Cristiano Ronaldo OR Al Nassr lang:en"),
     ("madrid", "Mbappe lang:en"),
@@ -402,6 +402,8 @@ def summarize(item):
         "\"summary\": \"1–2 句中文摘要，50–90 字，只讲最关键的事实、比分或数据\", "
         "\"source\": \"媒体名称，如 BBC Sport、卫报、ESPN、马卡报、新浪体育\", "
         f"\"priority\": 这条新闻是否主要关于{PRIORITY_TOPICS}（true 或 false）, "
+        "\"section\": \"最适合的栏目：madrid（皇马或其他西甲球队）、epl（英超球队）、"
+        "world（欧冠、国家队、其他联赛等国际足坛）、china（中国足球）\", "
         "\"paragraphs\": [\"正文整理成通顺的中文全文（英文原文就完整翻译，中文原文就保留原文措辞），"
         "按原文分段，每段一个字符串；去掉与新闻无关的内容（广告、导航、评论区、相关链接、图片说明、版权声明）\"]}。"
         "如果这不是一条足球新闻报道（例如赛程表、节目预告、竞猜、问答、广告、球队主页），"
@@ -415,6 +417,9 @@ def summarize(item):
     item["source"] = str(result.get("source") or item["source"]).strip()
     item["paragraphs"] = [p.strip() for p in result.get("paragraphs") or [] if isinstance(p, str) and p.strip()]
     item["priority"] = item.get("priority") or result.get("priority") is True
+    # 关键词归类会出错（例如利物浦的新闻被搜进西甲栏目），以 DeepSeek 读完全文后的判断为准
+    if result.get("section") in {key for key, _ in SECTIONS}:
+        item["section"] = result["section"]
     return item
 
 
@@ -517,17 +522,37 @@ def team_icon(name):
     return ""
 
 
+def plain_date(dt):
+    """「10月31日」中间插一个不可见字符，避免手机邮箱把日期识别成日历链接。"""
+    return f"{dt.month}月&#8204;{dt.day}日"
+
+
+# 窄屏（手机）样式。支持 <style> 的邮箱会用它覆盖下面的内联样式；不支持的照常显示桌面版
+MOBILE_STYLE = """
+<style>
+  body { margin: 0; padding: 0; -webkit-text-size-adjust: 100%; }
+  @media only screen and (max-width: 520px) {
+    .wrap { padding: 0 12px !important; }
+    .h1 { font-size: 20px !important; }
+    .h2 { font-size: 17px !important; margin: 24px 0 12px !important; }
+    .thumb-cell { width: 76px !important; padding-right: 10px !important; }
+    .thumb { width: 76px !important; height: 76px !important; border-radius: 10px !important; }
+    .title { font-size: 15px !important; line-height: 1.4 !important; }
+    .sum { font-size: 13.5px !important; line-height: 1.6 !important; margin: 4px 0 !important; }
+    .full p { font-size: 14px !important; line-height: 1.75 !important; }
+    .fx { font-size: 12.5px !important; }
+    .fx-when { width: 64px !important; }
+  }
+</style>
+"""
+
+
 def render_card(n, item):
     when = item["published"].astimezone(BEIJING)
-    tag = (
-        '<span style="display:inline-block;background:#f53f3f;color:#fff;font-size:11px;font-weight:600;'
-        'padding:1px 6px;border-radius:4px;margin-right:6px;vertical-align:2px">重点</span>'
-        if item.get("priority") else ""
-    )
     image = (
-        f'<td width="104" valign="top" style="padding:0 14px 0 0">'
-        f'<img src="{html.escape(item["image"])}" width="104" height="104" alt="" '
-        'style="display:block;width:104px;height:104px;object-fit:cover;border-radius:12px;border:0"></td>'
+        '<td class="thumb-cell" width="92" valign="top" style="width:92px;padding:0 12px 0 0">'
+        f'<img class="thumb" src="{html.escape(item["image"])}" width="92" height="92" alt="" '
+        'style="display:block;width:92px;height:92px;object-fit:cover;border-radius:12px;border:0"></td>'
         if item["image"] else ""
     )
     # 全文放在 <details> 里，点击展开；不支持 <details> 的邮箱会直接显示全文
@@ -536,18 +561,18 @@ def render_card(n, item):
         for p in item.get("paragraphs", [])
     )
     details = (
-        '<details style="margin:10px 0 0">'
-        '<summary style="cursor:pointer;color:#1a56db;font-size:13px">展开全文</summary>'
-        f'<div style="margin-top:10px;padding:12px 14px;background:#f6f8fa;border-radius:8px">{full_text}</div>'
+        '<details style="margin:8px 0 0">'
+        '<summary style="cursor:pointer;color:#1a56db;font-size:13px;padding:4px 0">展开全文</summary>'
+        f'<div class="full" style="margin-top:8px;padding:12px 14px;background:#f6f8fa;border-radius:8px">{full_text}</div>'
         "</details>"
         if full_text else ""
     )
     return (
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 22px">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px;table-layout:auto">'
         f"<tr>{image}<td valign=\"top\">"
-        f'<div style="color:#1d2129;font-size:16px;font-weight:700;line-height:1.45">{n}. {tag}{html.escape(item["title_zh"])}</div>'
-        f'<div style="color:#3a3f47;font-size:14px;line-height:1.7;margin:6px 0">{html.escape(item["summary_zh"])}</div>'
-        f'<div style="color:#86909c;font-size:12px">来源：{html.escape(item["source"])}，{when.month}月{when.day}日</div>'
+        f'<div class="title" style="color:#1d2129;font-size:16px;font-weight:700;line-height:1.45">{n}. {html.escape(item["title_zh"])}</div>'
+        f'<div class="sum" style="color:#3a3f47;font-size:14px;line-height:1.7;margin:6px 0">{html.escape(item["summary_zh"])}</div>'
+        f'<div style="color:#86909c;font-size:12px">来源：{html.escape(item["source"])} · {plain_date(when)}</div>'
         "</td></tr>"
         f'<tr><td colspan="2">{details}</td></tr>'
         "</table>"
@@ -557,26 +582,27 @@ def render_card(n, item):
 def render_fixtures(groups):
     if not groups:
         return '<p style="color:#86909c">未找到近期的相关赛程。</p>'
-    cell = "padding:6px 8px;border-bottom:1px solid #eee"
-    parts = ['<p style="color:#3a3f47;font-size:14px;margin:0 0 10px">以下均为北京时间：</p>']
+    cell = "padding:7px 6px;border-bottom:1px solid #eee;vertical-align:middle"
+    parts = ['<p style="color:#3a3f47;font-size:13px;margin:0 0 6px">以下均为北京时间：</p>']
     for g in groups:
         icon = icon_img(COMPETITION_ICONS[g["name"]], 22) if g["name"] in COMPETITION_ICONS else ""
         rows = []
         for m in g["matches"]:
             k = m["kickoff"]
             weight = "font-weight:700;" if "皇马" in (m["home"], m["away"]) else ""
-            note = f' <span style="color:#86909c">（{html.escape(m["note"])}）</span>' if m["note"] else ""
+            note = f'<div style="color:#86909c;font-size:12px;margin-top:2px">{html.escape(m["note"])}</div>' if m["note"] else ""
+            # 两列：左边日期和时间上下排，右边对阵，手机上不会挤
             rows.append(
                 f'<tr style="{weight}">'
-                f'<td style="{cell};white-space:nowrap">{k.month}月{k.day}日 {WEEKDAYS[k.weekday()]}</td>'
-                f'<td style="{cell}">{m["time"]}</td>'
+                f'<td class="fx-when" width="76" style="{cell};width:76px;white-space:nowrap;color:#3a3f47">'
+                f'{plain_date(k)} {WEEKDAYS[k.weekday()]}<br><span style="color:#1d2129">{m["time"]}</span></td>'
                 f'<td style="{cell}">{team_icon(m["home"])}{html.escape(m["home"])}'
                 f' <span style="color:#86909c">vs</span> {team_icon(m["away"])}{html.escape(m["away"])}{note}</td></tr>'
             )
         parts.append(
-            f'<div style="font-size:15px;font-weight:700;margin:16px 0 6px">{icon}{html.escape(g["name"])}</div>'
-            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1d2129;border-collapse:collapse">'
-            '<tr style="color:#86909c"><td style="padding:4px 8px">日期</td><td style="padding:4px 8px">时间</td><td style="padding:4px 8px">对阵</td></tr>'
+            f'<div style="font-size:15px;font-weight:700;margin:16px 0 4px">{icon}{html.escape(g["name"])}</div>'
+            '<table class="fx" role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            'style="font-size:13px;color:#1d2129;border-collapse:collapse">'
             + "".join(rows) + "</table>"
         )
     parts.append('<p style="color:#86909c;font-size:12px;margin-top:10px">赛程由 DeepSeek 从搜索结果中整理，具体开球时间请以赛事官方赛程为准。</p>')
@@ -584,13 +610,16 @@ def render_fixtures(groups):
 
 
 def section_title(text):
-    return f'<h2 style="font-size:19px;margin:30px 0 16px;color:#1d2129">{text}</h2>'
+    return f'<h2 class="h2" style="font-size:19px;margin:30px 0 16px;color:#1d2129">{text}</h2>'
 
 
 def render_email(items, groups, today):
     parts = [
-        f'<div style="font-family:{FONT};max-width:680px;margin:auto;color:#1d2129">',
-        f'<h1 style="font-size:22px;margin:0 0 4px">⚽ 足球简报 · {today}</h1>',
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"{MOBILE_STYLE}</head><body>",
+        f'<div class="wrap" style="font-family:{FONT};max-width:680px;margin:auto;padding:0 16px;color:#1d2129">',
+        f'<h1 class="h1" style="font-size:22px;margin:16px 0 4px">⚽ 足球简报 · {today}</h1>',
         '<p style="color:#86909c;font-size:12px;margin:0">近一天的足球新闻，点击「展开全文」查看完整内容</p>',
     ]
     n = 0
@@ -599,7 +628,7 @@ def render_email(items, groups, today):
         if key == "madrid":
             # 皇马新闻排在其他西甲新闻前面
             section_items.sort(key=lambda i: "皇马" not in i["title_zh"] and "皇家马德里" not in i["title_zh"])
-        # 重点话题排在最前面（sort 是稳定的，上面的顺序在组内保留）
+        # 重点话题排在最前面，不另加标记（sort 是稳定的，上面的顺序在组内保留）
         section_items.sort(key=lambda i: not i.get("priority"))
         parts.append(section_title(title))
         if not section_items:
@@ -609,7 +638,7 @@ def render_email(items, groups, today):
             parts.append(render_card(n, item))
     parts.append(section_title("五、近期赛程"))
     parts.append(render_fixtures(groups))
-    parts.append("</div>")
+    parts.append("</div></body></html>")
     return "".join(parts)
 
 
