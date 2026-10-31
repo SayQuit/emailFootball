@@ -1,7 +1,10 @@
-"""用 DeepSeek 搜索并整理足球新闻和赛程，生成中文简报发送到 QQ 邮箱。
+"""整理足球新闻和赛程，用 DeepSeek 生成中文简报，发送到 QQ 邮箱。
 
-新闻和赛程都由 DeepSeek 搜索 API（/v1/tools/search，返回带全文的搜索结果）查找，
-再由 DeepSeek 对话模型改写成中文标题、摘要和全文，并从搜索结果里提取赛程。
+外媒新闻以 BBC、卫报、ESPN、Managing Madrid 的 RSS 为主，从原网页提取正文，
+提取不到时用 DeepSeek 读取网页 API（/v1/tools/fetch）；再用 DeepSeek 搜索 API
+（/v1/tools/search，返回带全文的搜索结果）补充 RSS 没有的新闻。
+中国足球新闻和赛程完全由 DeepSeek 搜索查找。
+所有新闻都由 DeepSeek 对话模型改写成中文标题、摘要和全文，赛程也由它从搜索结果里提取。
 
 邮件结构:
     一、皇家马德里及西甲
@@ -33,12 +36,18 @@ from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from functools import lru_cache
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+import feedparser
+import trafilatura
+
 BEIJING = timezone(timedelta(hours=8))
-LOOKBACK_HOURS = 30  # 搜索结果的发布时间要在这个范围内
+LOOKBACK_HOURS = 30  # 新闻发布时间要在这个范围内
+MAX_FOREIGN_ARTICLES = 45  # 外媒新闻上限，控制运行时间和 API 费用
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 ARTICLE_MAX_CHARS = 6000
 FIXTURE_DAYS = 7
 MIN_RERANK_SCORE = 1.0  # DeepSeek 搜索的相关度分数（0–3），太低的结果不要
@@ -50,26 +59,50 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
 
-# 栏目：(键, 标题, 最多几条, 搜索词列表)。外媒栏目用 lang:en 只搜英文媒体
 SECTIONS = [
-    ("madrid", "一、皇家马德里及西甲", 15, [
-        "Real Madrid lang:en",
-        "Real Madrid Mourinho OR Mbappe OR Vinicius OR Bellingham lang:en",
-        "LaLiga lang:en",
-        "Barcelona OR Atletico Madrid lang:en",
-    ]),
-    ("epl", "二、英超焦点新闻", 12, [
-        "Premier League lang:en",
-        "Manchester United OR Manchester City lang:en",
-        "Arsenal OR Liverpool OR Chelsea OR Tottenham lang:en",
-    ]),
-    ("world", "三、国际足坛其他新闻", 12, [
-        "Champions League lang:en",
-        "international football national team lang:en",
-        "Serie A OR Bundesliga OR Ligue 1 lang:en",
-        "FIFA OR UEFA football lang:en",
-    ]),
-    ("china", "四、中国足球", 12, [
+    ("madrid", "一、皇家马德里及西甲"),
+    ("epl", "二、英超焦点新闻"),
+    ("world", "三、国际足坛其他新闻"),
+    ("china", "四、中国足球"),
+]
+
+# 外媒新闻源：(来源名, RSS 地址, 栏目提示)。栏目提示为 None 的综合源按关键词归类
+FEEDS = [
+    ("Managing Madrid", "https://www.managingmadrid.com/rss/current.xml", "madrid"),
+    ("卫报", "https://www.theguardian.com/football/realmadrid/rss", "madrid"),
+    ("卫报", "https://www.theguardian.com/football/laligafootball/rss", "laliga"),
+    ("卫报", "https://www.theguardian.com/football/premierleague/rss", "epl"),
+    ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/premier-league/rss.xml", "epl"),
+    ("卫报", "https://www.theguardian.com/football/championsleague/rss", "world"),
+    ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/champions-league/rss.xml", "world"),
+    ("卫报", "https://www.theguardian.com/football/world-cup-2026/rss", "world"),
+    ("BBC Sport", "https://feeds.bbci.co.uk/sport/football/rss.xml", None),
+    ("卫报", "https://www.theguardian.com/football/rss", None),
+    ("ESPN", "https://www.espn.com/espn/rss/soccer/news", None),
+]
+REAL_MADRID_PATTERN = re.compile(r"real madrid|bernab[eé]u", re.IGNORECASE)
+CHAMPIONS_LEAGUE_PATTERN = re.compile(r"champions league|europa league|conference league", re.IGNORECASE)
+LALIGA_PATTERN = re.compile(
+    r"la ?liga|barcelona|bar[cç]a\b|atl[eé]tico madrid|sevilla|villarreal|real betis|real sociedad|"
+    r"athletic club|valencia|girona|osasuna|celta vigo|getafe|mallorca|rayo vallecano|alav[eé]s|espanyol",
+    re.IGNORECASE,
+)
+EPL_PATTERN = re.compile(
+    r"premier league|arsenal|chelsea|liverpool|manchester united|man utd|manchester city|man city|"
+    r"tottenham|spurs|newcastle|aston villa|everton|brighton|crystal palace|fulham|brentford|"
+    r"bournemouth|nottingham forest|leeds|sunderland|coventry|ipswich|hull city",
+    re.IGNORECASE,
+)
+SKIP_TITLE_PATTERN = re.compile(r"\bthread\b|podcast|quiz|\bfpl\b|fantasy|gossip", re.IGNORECASE)
+OG_IMAGE_PATTERN = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', re.IGNORECASE)
+OG_IMAGE_REVERSED_PATTERN = re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', re.IGNORECASE)
+
+# DeepSeek 搜索：(栏目, 最多几条, 搜索词)。外媒栏目是对 RSS 的补充，中国足球完全靠搜索
+SEARCH_SECTIONS = [
+    ("madrid", 6, ["Real Madrid lang:en", "LaLiga OR Barcelona OR Atletico Madrid lang:en"]),
+    ("epl", 5, ["Premier League lang:en"]),
+    ("world", 5, ["Champions League OR national team football lang:en", "Serie A OR Bundesliga OR Ligue 1 lang:en"]),
+    ("china", 12, [
         "中超 lang:zh",
         "国足 lang:zh",
         "U23国足 OR 国奥 lang:zh",
@@ -142,6 +175,12 @@ def search(query, count=10):
     return results
 
 
+def fetch_page(url):
+    """DeepSeek 读取网页，返回 Markdown 正文，失败返回空字符串。"""
+    data = deepseek_post("/v1/tools/fetch", {"url": url}, timeout=60)
+    return (data or {}).get("content", "")
+
+
 def chat(user, max_tokens=800):
     """DeepSeek 对话，要求返回 JSON，解析失败返回 None。"""
     data = deepseek_post("/chat/completions", {
@@ -189,12 +228,99 @@ def first_image(markdown):
     return ""
 
 
-def collect_news():
-    """按栏目搜索新闻，只保留时间范围内、相关度够高、有正文的结果。"""
+def clean_text(text):
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    return " ".join(text.split())
+
+
+def feed_image(entry):
+    """RSS 自带配图，选宽度最接近 460 的一张（卫报的图片地址带签名，只能用 RSS 里现成的尺寸）。"""
+    candidates = [c for c in list(entry.get("media_content", [])) + list(entry.get("media_thumbnail", [])) if c.get("url")]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda c: abs(int(c.get("width") or 1200) - 460))["url"]
+
+
+@lru_cache(maxsize=None)
+def fetch_feed(source, url):
+    feed = feedparser.parse(url, agent=USER_AGENT)
+    if feed.get("bozo") and not feed.entries:
+        print(f"{source} 抓取失败: {url}: {feed.get('bozo_exception')}")
+        return ()
+    items = []
+    for entry in feed.entries:
+        published = entry.get("published_parsed") or entry.get("updated_parsed")
+        items.append({
+            "title": clean_text(entry.get("title", "")),
+            "summary": clean_text(entry.get("summary", ""))[:600],
+            "source": source,
+            "link": entry.get("link", ""),
+            "image": feed_image(entry),
+            "published": datetime(*published[:6], tzinfo=timezone.utc) if published else None,
+        })
+    print(f"{source}: {len(items)} 条 ({url[:60]})")
+    return tuple(items)
+
+
+def classify(item, hint):
+    text = f"{item['title']} {item['summary']}"
+    if REAL_MADRID_PATTERN.search(text):
+        return "madrid"
+    if hint == "world" or CHAMPIONS_LEAGUE_PATTERN.search(text):
+        return "world"
+    if hint in ("madrid", "laliga") or LALIGA_PATTERN.search(text):
+        return "madrid"
+    if hint == "epl" or EPL_PATTERN.search(text):
+        return "epl"
+    return "world"
+
+
+def collect_foreign_news(seen):
+    """读外媒 RSS，正文在 summarize 时再去原网页提取。"""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    items = []
+    for source, url, hint in FEEDS:
+        for raw in fetch_feed(source, url):
+            item = dict(raw)
+            key = normalize(item["title"])
+            if not key or key in seen or item["link"] in seen:
+                continue
+            if not item["published"] or item["published"] < cutoff:
+                continue
+            if SKIP_TITLE_PATTERN.search(item["title"]) or SKIP_URL_PATTERN.search(item["link"]):
+                continue
+            seen.update((key, item["link"]))
+            item["section"] = classify(item, hint)
+            items.append(item)
+    items.sort(key=lambda i: i["published"], reverse=True)
+    print(f"外媒新闻 {len(items)} 条，处理最新的 {min(len(items), MAX_FOREIGN_ARTICLES)} 条")
+    return items[:MAX_FOREIGN_ARTICLES]
+
+
+def fetch_article(url):
+    """打开原文提取正文和 og:image，失败返回空值。"""
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        text = trafilatura.extract(downloaded, include_comments=False, include_tables=False) if downloaded else None
+    except Exception as e:
+        print(f"正文提取失败 {url}: {e}")
+        return "", ""
+    if not downloaded:
+        return "", ""
+    match = OG_IMAGE_PATTERN.search(downloaded) or OG_IMAGE_REVERSED_PATTERN.search(downloaded)
+    image = html.unescape(match.group(1)) if match else ""
+    if not image.startswith("http") or BAD_IMAGE_PATTERN.search(image):
+        image = ""
+    return (text or "")[:ARTICLE_MAX_CHARS], image
+
+
+def collect_search_news(seen):
+    """用 DeepSeek 搜索：给外媒栏目补充 RSS 没有的新闻，并找中国足球新闻。
+    只保留时间范围内、相关度够高、有正文的结果；seen 里已有的（RSS 已收录的）跳过。"""
     after = (datetime.now(BEIJING) - timedelta(days=2)).strftime("%Y-%m-%d")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-    seen, items = set(), []
-    for key, _, limit, queries in SECTIONS:
+    items = []
+    for key, limit, queries in SEARCH_SECTIONS:
         candidates = []
         for query in queries:
             for r in search(f"{query} after:{after}"):
@@ -219,12 +345,23 @@ def collect_news():
         # 相关度高的优先，再按时间
         candidates.sort(key=lambda i: (i["score"], i["published"]), reverse=True)
         items.extend(candidates[:limit])
-        print(f"[{key}] 候选 {len(candidates)} 条，保留 {min(len(candidates), limit)} 条")
+        print(f"[{key}] 搜索补充 {min(len(candidates), limit)} 条（候选 {len(candidates)} 条）")
     return items
 
 
 def summarize(item):
     """生成中文标题、1–2 句摘要和全文。返回 None 表示这条不要。"""
+    if "content" not in item:
+        # RSS 新闻：去原网页提取正文；提取不到（例如 ESPN 靠 JavaScript 渲染）就让 DeepSeek 读取，再不行用 RSS 简介
+        body, og_image = fetch_article(item["link"])
+        if len(body) < 300:
+            page = fetch_page(item["link"])
+            if len(page) > len(body):
+                body = page[:ARTICLE_MAX_CHARS]
+                og_image = og_image or first_image(page)
+        item["content"] = body or item["summary"]
+        # 卫报的 og:image 是带签名的大图，优先用 RSS 里的小图
+        item["image"] = small_image(item["image"] if "guim.co.uk" in item["image"] else (og_image or item["image"]))
     result = chat(
         f"媒体：{item['source']}\n原标题：{item['title']}\n正文：\n{item['content']}\n\n"
         "请输出 JSON：{\"title\": \"简短的中文标题，不超过 20 字\", "
@@ -412,7 +549,7 @@ def render_email(items, groups, today):
         '<p style="color:#86909c;font-size:12px;margin:0">近一天的足球新闻，点击「展开全文」查看完整内容</p>',
     ]
     n = 0
-    for key, title, _, _ in SECTIONS:
+    for key, title in SECTIONS:
         section_items = sorted((i for i in items if i["section"] == key), key=lambda i: i["published"], reverse=True)
         if key == "madrid":
             # 皇马新闻排在其他西甲新闻前面
@@ -450,9 +587,11 @@ def main():
     if not os.environ.get("DEEPSEEK_API_KEY"):
         sys.exit("没有设置 DEEPSEEK_API_KEY")
 
-    items = collect_news()
+    seen = set()  # RSS 和搜索共用，避免同一篇文章收录两次
+    items = collect_foreign_news(seen)
+    items += collect_search_news(seen)
     if not items:
-        sys.exit("DeepSeek 没有搜到任何新闻，请检查 API Key 余额或搜索权限")
+        sys.exit("没有找到任何新闻，请检查新闻源和 DeepSeek API Key")
     items = drop_duplicates(summarize_all(items))
     groups = collect_fixtures()
 
