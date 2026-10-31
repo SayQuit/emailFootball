@@ -1,2 +1,1 @@
-feedparser==6.0.11
-trafilatura==1.12.2
+# 只用 Python 标准库，没有第三方依赖
