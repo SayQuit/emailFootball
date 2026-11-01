@@ -45,7 +45,7 @@ import feedparser
 import trafilatura
 
 BEIJING = timezone(timedelta(hours=8))
-LOOKBACK_HOURS = 30  # 新闻发布时间要在这个范围内
+LOOKBACK_HOURS = 14  # 每天发两份（间隔 11 和 13 小时），只收上一份之后的新闻，多留 1 小时抵消定时任务延迟
 MAX_FOREIGN_ARTICLES = 45  # 外媒新闻上限，控制运行时间和 API 费用
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 ARTICLE_MAX_CHARS = 6000
@@ -620,7 +620,7 @@ def render_email(items, groups, today):
         f"{MOBILE_STYLE}</head><body>",
         f'<div class="wrap" style="font-family:{FONT};max-width:680px;margin:auto;padding:0 16px;color:#1d2129">',
         f'<h1 class="h1" style="font-size:22px;margin:16px 0 4px">⚽ 足球简报 · {today}</h1>',
-        '<p style="color:#86909c;font-size:12px;margin:0">近一天的足球新闻，点击「展开全文」查看完整内容</p>',
+        '<p style="color:#86909c;font-size:12px;margin:0">上一份简报之后的足球新闻，点击「展开全文」查看完整内容</p>',
     ]
     n = 0
     for key, title in SECTIONS:
